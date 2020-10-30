@@ -18,12 +18,12 @@ use futures::{
         mpsc,
         oneshot,
     },
+    executor,
+    future,
     AsyncRead,
     AsyncReadExt,
     AsyncWrite,
     AsyncWriteExt,
-    executor,
-    future,
     FutureExt,
     StreamExt,
 };
@@ -44,11 +44,8 @@ pub struct FetchResults {
     pub connection: Box<dyn Connection>,
 }
 
-type ResourceHandler = dyn FnMut(
-    Request,
-    Box<dyn Connection>,
-    Vec<u8>,
-) -> FetchResults; // + Send + Unpin + 'static;
+type ResourceHandler =
+    dyn FnMut(Request, Box<dyn Connection>, Vec<u8>) -> FetchResults; // + Send + Unpin + 'static;
 
 #[derive(Debug)]
 enum WorkerMessage {
@@ -57,7 +54,7 @@ enum WorkerMessage {
 
     // This tells the worker thread to start listening for incoming requests
     // from HTTP clients.
-    StartListening{
+    StartListening {
         listener: TcpListener,
         result_sender: oneshot::Sender<Result<(), Error>>,
     },
@@ -93,8 +90,13 @@ async fn accept_connections(
                 // with this same async block) we can take the listener back
                 // out.
                 println!("accept_connections: Accepting next connection");
-                if let Ok((connection, address)) = current_listener.accept().await {
-                    println!("accept_connections: Connection received from {}", address);
+                if let Ok((connection, address)) =
+                    current_listener.accept().await
+                {
+                    println!(
+                        "accept_connections: Connection received from {}",
+                        address
+                    );
                     listener.replace(Some(current_listener));
                     connection_sender.unbounded_send(Box::new(connection));
                 } else {
@@ -146,7 +148,7 @@ enum ProcessorKind {
 }
 
 async fn handle_connections(
-    mut connection_receiver: mpsc::UnboundedReceiver<Box<dyn Connection>>,
+    mut connection_receiver: mpsc::UnboundedReceiver<Box<dyn Connection>>
 ) {
     let mut processors = Vec::new();
     let mut needs_next_connection = true;
@@ -160,33 +162,38 @@ async fn handle_connections(
                 // future never completes.
                 let connection = connection_receiver.next().await.unwrap();
 
-                processors.push(async {
-                    // TODO: Here is where we will be receiving the request
-                    // from the HTTP client, sending it to a request handler,
-                    // and sending back a response (possibly in a loop).
+                processors.push(
+                    async {
+                        // TODO: Here is where we will be receiving the request
+                        // from the HTTP client, sending it to a request
+                        // handler, and sending back a
+                        // response (possibly in a loop).
 
-                    // The output indicates that this is the future used
-                    // to receive the next connection.
-                    ProcessorKind::Connection
-                }.boxed());
+                        // The output indicates that this is the future used
+                        // to receive the next connection.
+                        ProcessorKind::Connection
+                    }
+                    .boxed(),
+                );
 
                 // The output indicates that this is the future used
                 // to receive the next connection.
                 ProcessorKind::Receiver
-            }.boxed();
+            }
+            .boxed();
 
             // Add the "next connection" future to our collection.
             processors.push(next_connection);
         }
 
         // Wait until a connection or the "connection receiver" completes.
-        let (processor_kind, _, processors_left) = future::select_all(
-            processors.into_iter()
-        ).await;
+        let (processor_kind, _, processors_left) =
+            future::select_all(processors.into_iter()).await;
 
         // If it was the "connection receiver" future which completed, mark
         // that we will need to make a new one for the next loop.
-        needs_next_connection = matches!(processor_kind, ProcessorKind::Receiver);
+        needs_next_connection =
+            matches!(processor_kind, ProcessorKind::Receiver);
 
         // All incomplete futures go back to be collected next loop.
         processors = processors_left;
@@ -201,9 +208,7 @@ async fn handle_messages(
     println!("handle_messages: processing messages");
     work_in_receiver
         // The special `Stop` message completes the stream.
-        .take_while(|message| future::ready(
-            !matches!(message, WorkerMessage::Exit)
-        ))
+        .take_while(|message| future::ready(!matches!(message, WorkerMessage::Exit)))
         .for_each(|message| async {
             println!("handle_messages: got message {:?}", message);
             match message {
@@ -211,37 +216,38 @@ async fn handle_messages(
                 // it causes the stream to end early so we won't get this far.
                 WorkerMessage::Exit => unreachable!(),
 
-                WorkerMessage::StartListening{
+                WorkerMessage::StartListening {
                     listener,
-                    result_sender
+                    result_sender,
                 } => {
-                    result_sender.send({
-                        println!(
-                            "handle_messages: Now listening for connections on port {}.",
-                            listener.local_addr().unwrap().port()
-                        );
-                        // This should never fail because `accept_connections`,
-                        // which holds the receiver, never drops the receiver.
-                        listener_sender.unbounded_send(
-                            ListenerMessage::Start(listener)
-                        ).unwrap();
-                        Ok(())
-                    }).unwrap_or(());
-                },
+                    result_sender
+                        .send({
+                            println!(
+                                "handle_messages: Now listening for connections on port {}.",
+                                listener.local_addr().unwrap().port()
+                            );
+                            // This should never fail because `accept_connections`,
+                            // which holds the receiver, never drops the receiver.
+                            listener_sender
+                                .unbounded_send(ListenerMessage::Start(listener))
+                                .unwrap();
+                            Ok(())
+                        })
+                        .unwrap_or(());
+                }
             }
-        }).await;
+        })
+        .await;
     println!("handle_messages: exiting");
 }
 
-async fn worker(
-    work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>
-) {
+async fn worker(work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>) {
     // These channels are used to pass values between the various
     // sub-tasks below.
     // * listener sender/receiver passes TcpListener values from
     //   `handle_messages` to `accept_connections`.
-    // * connection sender/receiver passes boxed Connection values
-    //   from `accept_connections` to `handle_connections`.
+    // * connection sender/receiver passes boxed Connection values from
+    //   `accept_connections` to `handle_connections`.
     let (listener_sender, listener_receiver) = mpsc::unbounded();
     let (connection_sender, connection_receiver) = mpsc::unbounded();
     futures::select!(
@@ -277,20 +283,18 @@ impl HttpServer {
         // giving it the receiver end as well as the TCP listener.
         Self {
             work_in: sender,
-            worker: Some(
-                thread::spawn(|| executor::block_on(
-                    worker(receiver)
-                )),
-            ),
+            worker: Some(thread::spawn(|| {
+                executor::block_on(worker(receiver))
+            })),
         }
     }
 
     pub fn register<P>(
         &mut self,
         path: P,
-        resource_handler: Box<ResourceHandler>
-    )
-        where P: Into<Vec<Vec<u8>>>
+        resource_handler: Box<ResourceHandler>,
+    ) where
+        P: Into<Vec<Vec<u8>>>,
     {
     }
 
@@ -299,17 +303,20 @@ impl HttpServer {
         port: u16,
         _use_tls: bool,
     ) -> Result<(), Error> {
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .await
             .map_err(Error::Bind)?;
         let (result_sender, result_receiver) = oneshot::channel();
         // It shouldn't be possible for this to fail, since the worker holds
         // the receiver for this channel, and isn't dropped until the client
         // itself is dropped.  So if it does fail, we want to know about it
         // since it would mean we have a bug.
-        self.work_in.unbounded_send(WorkerMessage::StartListening{
-            listener,
-            result_sender,
-        }).unwrap();
+        self.work_in
+            .unbounded_send(WorkerMessage::StartListening {
+                listener,
+                result_sender,
+            })
+            .unwrap();
         // It shouldn't be possible for this to fail, since the worker will
         // always send us back an answer; it should never drop the sender of
         // the channel before doing so.  So if it does fail, we want to know

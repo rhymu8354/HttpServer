@@ -24,7 +24,7 @@ fn handle_request(
     response.reason_phrase = "OK".into();
     response.body = b"Hello, World!".to_vec();
     response.headers.set_header("Content-Type", "text/plain; charset=utf-8");
-    FetchResults{
+    FetchResults {
         response,
         connection,
     }
@@ -32,10 +32,7 @@ fn handle_request(
 
 async fn main_async() {
     let mut server = HttpServer::new();
-    server.register(
-        &[b"foo".to_vec()][..],
-        Box::new(handle_request)
-    );
+    server.register(&[b"foo".to_vec()][..], Box::new(handle_request));
     match server.start(8080, false).await {
         Ok(()) => futures::future::pending().await,
         Err(error) => {
@@ -43,7 +40,7 @@ async fn main_async() {
                 Some(source) => eprintln!("error: {} ({})", error, source),
                 None => eprintln!("error: {}", error),
             };
-        }
+        },
     }
 }
 
