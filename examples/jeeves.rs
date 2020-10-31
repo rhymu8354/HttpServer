@@ -11,28 +11,40 @@ use rhymuweb_server::{
     Connection,
     FetchResults,
     HttpServer,
+    ResourceFuture,
 };
-use std::error::Error as _;
+use std::{
+    error::Error as _,
+    sync::Arc,
+};
 
 fn handle_request(
     _request: Request,
     connection: Box<dyn Connection>,
     _trailer: Vec<u8>,
-) -> FetchResults {
-    let mut response = Response::new();
-    response.status_code = 200;
-    response.reason_phrase = "OK".into();
-    response.body = b"Hello, World!".to_vec();
-    response.headers.set_header("Content-Type", "text/plain; charset=utf-8");
-    FetchResults {
-        response,
-        connection,
+) -> ResourceFuture {
+    async {
+        let mut response = Response::new();
+        response.status_code = 200;
+        response.reason_phrase = "OK".into();
+        response.body = b"Hello, World!".to_vec();
+        response
+            .headers
+            .set_header("Content-Type", "text/plain; charset=utf-8");
+        FetchResults {
+            response,
+            connection,
+        }
     }
+    .boxed()
 }
 
 async fn main_async() {
     let mut server = HttpServer::new();
-    server.register(&[b"foo".to_vec()][..], Box::new(handle_request));
+    server.register(
+        &[b"".to_vec(), b"foo".to_vec()][..],
+        Arc::new(handle_request),
+    );
     match server.start(8080, false).await {
         Ok(()) => futures::future::pending().await,
         Err(error) => {

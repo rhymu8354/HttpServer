@@ -34,6 +34,10 @@ use rhymuweb::{
 };
 use std::{
     cell::RefCell,
+    collections::{
+        hash_map,
+        HashMap,
+    },
     error::Error as _,
     future::Future,
     pin::Pin,
@@ -52,10 +56,22 @@ pub struct FetchResults {
     pub connection: Box<dyn Connection>,
 }
 
-type ResourceHandler =
-    dyn FnMut(Request, Box<dyn Connection>, Vec<u8>) -> FetchResults; // + Send + Unpin + 'static;
+pub type ResourceFuture =
+    Pin<Box<dyn Future<Output = FetchResults> + Send + 'static>>;
 
-#[derive(Debug)]
+type ResourceHandler = dyn Fn(Request, Box<dyn Connection>, Vec<u8>) -> ResourceFuture
+    + Send
+    + Sync
+    + Unpin
+    + 'static;
+
+type ResourceHandlerCollection = HashMap<Vec<Vec<u8>>, Arc<ResourceHandler>>;
+
+struct ResourceHandlerWithPath {
+    path: Vec<Vec<u8>>,
+    handler: Arc<ResourceHandler>,
+}
+
 enum WorkerMessage {
     // This tells the worker thread to terminate.
     Exit,
@@ -65,6 +81,11 @@ enum WorkerMessage {
     StartListening {
         listener: TcpListener,
         result_sender: oneshot::Sender<Result<(), Error>>,
+    },
+
+    RegisterHandler {
+        path: Vec<Vec<u8>>,
+        handler: Arc<ResourceHandler>,
     },
 }
 
@@ -196,20 +217,43 @@ async fn receive_request(
 }
 
 async fn handle_connection(
-    connection: Box<dyn Connection>
+    connection: Box<dyn Connection>,
+    handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) -> Result<Box<dyn Connection>, Error> {
     // Assemble HTTP request from incoming data.
-    let (_, mut connection, _) = receive_request(connection).await?;
+    let (request, mut connection, trailer) =
+        receive_request(connection).await?;
 
-    // Come up with a response and send it.
-    // TODO: Dispatch request to handler (use default "not
+    // Dispatch request to handler (use default "not
     // found" handler if we can't find one) to produce an HTTP
     // response.
     //
-    // For now, just make a 404 "Not Found" response.
-    let mut response = Response::new();
-    response.status_code = 404;
-    response.reason_phrase = "Not Found".into();
+    // TODO: It would be nice if `Uri` had a `take_path` function
+    // so that we wouldn't have to clone the path here.
+    let handler_factory_reference = if let Some(handler_factory) =
+        handlers.lock().expect("").get(request.target.path())
+    {
+        Some(handler_factory.clone())
+    } else {
+        None
+    };
+    let (response, mut connection) =
+        if let Some(handler_factory) = handler_factory_reference {
+            let handler = handler_factory(request, connection, trailer);
+            let mut fetch_results = handler.await;
+            if !fetch_results.response.body.is_empty() {
+                fetch_results.response.headers.set_header(
+                    "Content-Length",
+                    fetch_results.response.body.len().to_string(),
+                );
+            }
+            (fetch_results.response, fetch_results.connection)
+        } else {
+            let mut response = Response::new();
+            response.status_code = 404;
+            response.reason_phrase = "Not Found".into();
+            (response, connection)
+        };
 
     // Send the HTTP response back through the connection.
     let raw_response = response.generate().map_err(Error::BadResponse)?;
@@ -220,6 +264,7 @@ async fn handle_connection(
 async fn await_next_connection(
     mut connection_receiver: mpsc::UnboundedReceiver<Box<dyn Connection>>,
     processors: Arc<Mutex<Vec<Processor>>>,
+    handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) -> ProcessorKind {
     // Wait for the next connection to come in.
     //
@@ -231,10 +276,11 @@ async fn await_next_connection(
     let connection = next_connection.await.expect(
         "this task receives connections from other task which should never complete"
     );
+    let handlers_ref = handlers.clone();
     processors.lock().expect("last thread that held processors panicked").push(
         async {
             // Assemble HTTP request from incoming data.
-            match handle_connection(connection).await {
+            match handle_connection(connection, handlers_ref).await {
                 Ok(_) => {
                     // TODO: We might want to hold onto the connection
                     // in case the client is going to send another request.
@@ -262,7 +308,8 @@ async fn await_next_connection(
 }
 
 async fn handle_connections(
-    connection_receiver: mpsc::UnboundedReceiver<Box<dyn Connection>>
+    connection_receiver: mpsc::UnboundedReceiver<Box<dyn Connection>>,
+    handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) {
     let processors = Arc::new(Mutex::new(Vec::new()));
     let mut needs_next_connection = true;
@@ -285,6 +332,7 @@ async fn handle_connections(
                     "somehow we fumbled the connection receiver between connections"
                 ),
                 processors.clone(),
+                handlers.clone(),
             )
             .boxed();
 
@@ -328,6 +376,7 @@ async fn handle_connections(
 async fn handle_messages(
     work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>,
     listener_sender: mpsc::UnboundedSender<ListenerMessage>,
+    handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) {
     // Drive to completion the stream of messages to the worker thread.
     println!("handle_messages: processing messages");
@@ -335,7 +384,6 @@ async fn handle_messages(
         // The special `Stop` message completes the stream.
         .take_while(|message| future::ready(!matches!(message, WorkerMessage::Exit)))
         .for_each(|message| async {
-            println!("handle_messages: got message {:?}", message);
             match message {
                 // We already handled `Exit` in the `take_while` above;
                 // it causes the stream to end early so we won't get this far.
@@ -345,6 +393,7 @@ async fn handle_messages(
                     listener,
                     result_sender,
                 } => {
+                    println!("handle_messages: got StartListening message");
                     // It's possible for the `send` here to fail, if the user
                     // of the library gave up waiting for the result of
                     // starting the server.  In that case we just drop
@@ -366,6 +415,15 @@ async fn handle_messages(
                         })
                         .unwrap_or(());
                 }
+
+                WorkerMessage::RegisterHandler {
+                    path,
+                    handler,
+                } => {
+                    handlers.lock().expect(
+                        "last thread that held handlers panicked"
+                    ).insert(path, handler);
+                },
             }
         })
         .await;
@@ -379,6 +437,7 @@ async fn worker(work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>) {
     //   `handle_messages` to `accept_connections`.
     // * connection sender/receiver passes boxed Connection values from
     //   `accept_connections` to `handle_connections`.
+    let handlers = Arc::new(Mutex::new(HashMap::new()));
     let (listener_sender, listener_receiver) = mpsc::unbounded();
     let (connection_sender, connection_receiver) = mpsc::unbounded();
     futures::select!(
@@ -387,12 +446,13 @@ async fn worker(work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>) {
         // stored.
         () = handle_messages(
             work_in_receiver,
-            listener_sender
+            listener_sender,
+            handlers.clone(),
         ).fuse() => (),
 
         () = accept_connections(listener_receiver, connection_sender).fuse() => (),
 
-        () = handle_connections(connection_receiver).fuse() => (),
+        () = handle_connections(connection_receiver, handlers).fuse() => (),
     );
 }
 
@@ -423,10 +483,16 @@ impl HttpServer {
     pub fn register<P>(
         &mut self,
         path: P,
-        resource_handler: Box<ResourceHandler>,
+        handler: Arc<ResourceHandler>,
     ) where
         P: Into<Vec<Vec<u8>>>,
     {
+        self.work_in
+            .unbounded_send(WorkerMessage::RegisterHandler {
+                path: path.into(),
+                handler,
+            })
+            .expect("worker message dropped before it could reach the worker");
     }
 
     pub async fn start(
