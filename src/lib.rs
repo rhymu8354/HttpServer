@@ -34,10 +34,7 @@ use rhymuweb::{
 };
 use std::{
     cell::RefCell,
-    collections::{
-        hash_map,
-        HashMap,
-    },
+    collections::HashMap,
     error::Error as _,
     future::Future,
     pin::Pin,
@@ -66,11 +63,6 @@ type ResourceHandler = dyn Fn(Request, Box<dyn Connection>, Vec<u8>) -> Resource
     + 'static;
 
 type ResourceHandlerCollection = HashMap<Vec<Vec<u8>>, Arc<ResourceHandler>>;
-
-struct ResourceHandlerWithPath {
-    path: Vec<Vec<u8>>,
-    handler: Arc<ResourceHandler>,
-}
 
 enum WorkerMessage {
     // This tells the worker thread to terminate.
@@ -221,8 +213,7 @@ async fn handle_connection(
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) -> Result<Box<dyn Connection>, Error> {
     // Assemble HTTP request from incoming data.
-    let (request, mut connection, trailer) =
-        receive_request(connection).await?;
+    let (request, connection, trailer) = receive_request(connection).await?;
 
     // Dispatch request to handler (use default "not
     // found" handler if we can't find one) to produce an HTTP
@@ -230,13 +221,8 @@ async fn handle_connection(
     //
     // TODO: It would be nice if `Uri` had a `take_path` function
     // so that we wouldn't have to clone the path here.
-    let handler_factory_reference = if let Some(handler_factory) =
-        handlers.lock().expect("").get(request.target.path())
-    {
-        Some(handler_factory.clone())
-    } else {
-        None
-    };
+    let handler_factory_reference =
+        handlers.lock().expect("").get(request.target.path()).map(Clone::clone);
     let (response, mut connection) =
         if let Some(handler_factory) = handler_factory_reference {
             let handler = handler_factory(request, connection, trailer);
