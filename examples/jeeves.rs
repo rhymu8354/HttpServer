@@ -33,7 +33,7 @@ fn handle_request(
             .set_header("Content-Type", "text/plain; charset=utf-8");
         FetchResults {
             response,
-            connection,
+            connection: Some(connection),
         }
     }
     .boxed()

@@ -50,7 +50,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for T {}
 
 pub struct FetchResults {
     pub response: Response,
-    pub connection: Box<dyn Connection>,
+    pub connection: Option<Box<dyn Connection>>,
 }
 
 pub type ResourceFuture =
@@ -183,8 +183,8 @@ enum ProcessorKind {
 type Processor = Pin<Box<dyn Future<Output = ProcessorKind> + Send>>;
 
 async fn receive_request(
-    mut connection: Box<dyn Connection>
-) -> Result<(Request, Box<dyn Connection>, Vec<u8>), Error> {
+    connection: &mut dyn Connection
+) -> Result<(Request, Vec<u8>), Error> {
     let mut request = Request::new();
     let mut receive_buffer = Vec::new();
     loop {
@@ -203,7 +203,7 @@ async fn receive_request(
             request.parse(&mut receive_buffer).map_err(Error::BadRequest)?;
         receive_buffer.drain(0..request_status.consumed);
         if request_status.status == RequestParseStatus::Complete {
-            return Ok((request, connection, receive_buffer));
+            return Ok((request, receive_buffer));
         }
     }
 }
@@ -211,40 +211,103 @@ async fn receive_request(
 async fn handle_connection(
     connection: Box<dyn Connection>,
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
-) -> Result<Box<dyn Connection>, Error> {
-    // Assemble HTTP request from incoming data.
-    let (request, connection, trailer) = receive_request(connection).await?;
+) -> Result<(), Error> {
+    let mut connection_origin = Some(connection);
+    loop {
+        // Assemble HTTP request from incoming data.
+        let mut connection = connection_origin
+            .take()
+            .expect("we somehow dropped the connection");
+        let (request, trailer) = receive_request(&mut connection).await?;
 
-    // Dispatch request to handler (use default "not
-    // found" handler if we can't find one) to produce an HTTP
-    // response.
-    //
-    // TODO: It would be nice if `Uri` had a `take_path` function
-    // so that we wouldn't have to clone the path here.
-    let handler_factory_reference =
-        handlers.lock().expect("").get(request.target.path()).map(Clone::clone);
-    let (response, mut connection) =
-        if let Some(handler_factory) = handler_factory_reference {
-            let handler = handler_factory(request, connection, trailer);
-            let mut fetch_results = handler.await;
-            if !fetch_results.response.body.is_empty() {
-                fetch_results.response.headers.set_header(
-                    "Content-Length",
-                    fetch_results.response.body.len().to_string(),
-                );
+        // Peek into the request to see if we should close this connection
+        // after the response has been sent.
+        let close_after_response =
+            request.headers.has_header_token("Connection", "close");
+
+        // Dispatch request to handler (use default "not
+        // found" handler if we can't find one) to produce an HTTP
+        // response.
+        let handler_factory_reference = handlers
+            .lock()
+            .expect("")
+            .get(request.target.path())
+            .map(Clone::clone);
+        let (mut response, connection) =
+            if let Some(handler_factory) = handler_factory_reference {
+                let handler = handler_factory(request, connection, trailer);
+                let mut fetch_results = handler.await;
+                if !fetch_results.response.body.is_empty() {
+                    fetch_results.response.headers.set_header(
+                        "Content-Length",
+                        fetch_results.response.body.len().to_string(),
+                    );
+                }
+                (fetch_results.response, fetch_results.connection)
+            } else {
+                let mut response = Response::new();
+                response.status_code = 404;
+                response.reason_phrase = "Not Found".into();
+                (response, Some(connection))
+            };
+
+        if let Some(mut connection) = connection {
+            // If we're supposed to close the connection after sending
+            // the response, tell the client so via the "close" token
+            // in the "Connection" header.
+            if close_after_response {
+                let mut tokens = response.headers.header_tokens("Connection");
+                if tokens.iter().all(|token| token != "close") {
+                    tokens.push("close".into());
+                    response
+                        .headers
+                        .set_header("Connection", tokens.join(", "));
+                }
             }
-            (fetch_results.response, fetch_results.connection)
-        } else {
-            let mut response = Response::new();
-            response.status_code = 404;
-            response.reason_phrase = "Not Found".into();
-            (response, connection)
-        };
 
-    // Send the HTTP response back through the connection.
-    let raw_response = response.generate().map_err(Error::BadResponse)?;
-    connection.write_all(&raw_response).await.map_err(Error::UnableToSend)?;
-    Ok(connection)
+            // Send the HTTP response back through the connection.
+            let raw_response =
+                response.generate().map_err(Error::BadResponse)?;
+            connection
+                .write_all(&raw_response)
+                .await
+                .map_err(Error::UnableToSend)?;
+
+            // If we're supposed to close the connection after sending
+            // the response, hold onto it for an arbitrary but relatively
+            // short amount of time, to ensure the entire response makes
+            // it through the protocol stack and transmitted to the client.
+            //
+            // TODO: It might not actually necessary to do this.  It all
+            // depends on how the protocol stack, operating system, and
+            // Rust libraries handle the socket and any data associated
+            // with it that the client still hasn't received at the moment
+            // the underlying `TcpStream` is dropped.
+            //
+            // A compromise might be to close the connection if either of the
+            // following happens first:
+            //
+            // 1. The client closes their end (we get a read output of 0 bytes,
+            //    in other words, EOF).
+            // 2. Some arbitrary grace period elapses (like 5 seconds).
+            //
+            // Otherwise, put the connection back so it can be reused for the
+            // next request at the top of the loop.
+            if close_after_response {
+                async_std::future::timeout(
+                    std::time::Duration::from_secs(5),
+                    futures::future::pending::<()>(),
+                )
+                .await
+                .unwrap_or(());
+                return Ok(());
+            } else {
+                connection_origin.replace(connection);
+            }
+        } else {
+            return Ok(());
+        }
+    }
 }
 
 async fn await_next_connection(
@@ -266,20 +329,17 @@ async fn await_next_connection(
     processors.lock().expect("last thread that held processors panicked").push(
         async {
             // Assemble HTTP request from incoming data.
-            match handle_connection(connection, handlers_ref).await {
-                Ok(_) => {
-                    // TODO: We might want to hold onto the connection
-                    // in case the client is going to send another request.
-                },
-                Err(error) => {
-                    match error.source() {
-                        Some(source) => {
-                            eprintln!("error: {} ({})", error, source)
-                        },
-                        None => eprintln!("error: {}", error),
-                    };
-                },
-            }
+            if let Err(error) =
+                handle_connection(connection, handlers_ref).await
+            {
+                // TODO: We probably want better error reporting up to
+                // the owner of this server, rather than printing to
+                // standard error stream like a pleb.
+                match error.source() {
+                    Some(source) => eprintln!("error: {} ({})", error, source),
+                    None => eprintln!("error: {}", error),
+                };
+            };
 
             // The output indicates that this is the future used
             // to receive the next connection.
