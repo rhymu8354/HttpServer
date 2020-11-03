@@ -45,22 +45,18 @@ use std::{
     thread,
 };
 
-pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for T {}
+pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Connection for T {}
 
 pub struct FetchResults {
     pub response: Response,
     pub connection: Box<dyn Connection>,
 }
 
-pub type ResourceFuture =
-    Pin<Box<dyn Future<Output = FetchResults> + Send + 'static>>;
+pub type ResourceFuture = Pin<Box<dyn Future<Output = FetchResults> + Send>>;
 
-type ResourceHandler = dyn Fn(Request, Box<dyn Connection>) -> ResourceFuture
-    + Send
-    + Sync
-    + Unpin
-    + 'static;
+type ResourceHandler =
+    dyn Fn(Request, Box<dyn Connection>) -> ResourceFuture + Send + Sync;
 
 type ResourceHandlerCollection = HashMap<Vec<Vec<u8>>, Arc<ResourceHandler>>;
 
