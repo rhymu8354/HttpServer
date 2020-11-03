@@ -48,9 +48,12 @@ use std::{
 pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Connection for T {}
 
+pub type OnUpgradedCallback = dyn FnOnce(Box<dyn Connection>) + Send;
+
 pub struct FetchResults {
     pub response: Response,
     pub connection: Box<dyn Connection>,
+    pub on_upgraded: Option<Box<OnUpgradedCallback>>,
 }
 
 pub type ResourceFuture = Pin<Box<dyn Future<Output = FetchResults> + Send>>;
@@ -236,7 +239,7 @@ async fn handle_connection(
             .expect("")
             .get(request.target.path())
             .map(Clone::clone);
-        let (mut response, mut connection) =
+        let (mut response, mut connection, on_upgraded) =
             if let Some(handler_factory) = handler_factory_reference {
                 let handler = handler_factory(request, connection);
                 let mut fetch_results = handler.await;
@@ -246,12 +249,16 @@ async fn handle_connection(
                         fetch_results.response.body.len().to_string(),
                     );
                 }
-                (fetch_results.response, fetch_results.connection)
+                (
+                    fetch_results.response,
+                    fetch_results.connection,
+                    fetch_results.on_upgraded,
+                )
             } else {
                 let mut response = Response::new();
                 response.status_code = 404;
                 response.reason_phrase = "Not Found".into();
-                (response, connection)
+                (response, connection, None)
             };
 
         // If we're supposed to close the connection after sending
@@ -301,8 +308,9 @@ async fn handle_connection(
             .unwrap_or(());
             return Ok(());
         } else if response.status_code == 101 {
-            // TODO: Here is where we would give the connection to the resource
-            // handler somehow.
+            if let Some(on_upgraded) = on_upgraded {
+                on_upgraded(connection);
+            }
             return Ok(());
         } else {
             connection_origin.replace(connection);

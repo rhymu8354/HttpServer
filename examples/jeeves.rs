@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
 };
 
-fn handle_request(
+fn handle_request_factory(
     _request: Request,
     connection: Box<dyn Connection>,
 ) -> ResourceFuture {
@@ -33,6 +33,7 @@ fn handle_request(
         FetchResults {
             response,
             connection,
+            on_upgraded: None,
         }
     }
     .boxed()
@@ -42,7 +43,7 @@ async fn main_async() {
     let mut server = HttpServer::new();
     server.register(
         &[b"".to_vec(), b"foo".to_vec()][..],
-        Arc::new(handle_request),
+        Arc::new(handle_request_factory),
     );
     match server.start(8080, false).await {
         Ok(()) => futures::future::pending().await,
