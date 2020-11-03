@@ -50,7 +50,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Connection for T {}
 
 pub struct FetchResults {
     pub response: Response,
-    pub connection: Option<Box<dyn Connection>>,
+    pub connection: Box<dyn Connection>,
 }
 
 pub type ResourceFuture =
@@ -233,7 +233,7 @@ async fn handle_connection(
             .expect("")
             .get(request.target.path())
             .map(Clone::clone);
-        let (mut response, connection) =
+        let (mut response, mut connection) =
             if let Some(handler_factory) = handler_factory_reference {
                 let handler = handler_factory(request, connection, trailer);
                 let mut fetch_results = handler.await;
@@ -248,64 +248,57 @@ async fn handle_connection(
                 let mut response = Response::new();
                 response.status_code = 404;
                 response.reason_phrase = "Not Found".into();
-                (response, Some(connection))
+                (response, connection)
             };
 
-        if let Some(mut connection) = connection {
-            // If we're supposed to close the connection after sending
-            // the response, tell the client so via the "close" token
-            // in the "Connection" header.
-            if close_after_response {
-                let mut tokens = response.headers.header_tokens("Connection");
-                if tokens.iter().all(|token| token != "close") {
-                    tokens.push("close".into());
-                    response
-                        .headers
-                        .set_header("Connection", tokens.join(", "));
-                }
+        // If we're supposed to close the connection after sending
+        // the response, tell the client so via the "close" token
+        // in the "Connection" header.
+        if close_after_response {
+            let mut tokens = response.headers.header_tokens("Connection");
+            if tokens.iter().all(|token| token != "close") {
+                tokens.push("close".into());
+                response.headers.set_header("Connection", tokens.join(", "));
             }
+        }
 
-            // Send the HTTP response back through the connection.
-            let raw_response =
-                response.generate().map_err(Error::BadResponse)?;
-            connection
-                .write_all(&raw_response)
-                .await
-                .map_err(Error::UnableToSend)?;
+        // Send the HTTP response back through the connection.
+        let raw_response = response.generate().map_err(Error::BadResponse)?;
+        connection
+            .write_all(&raw_response)
+            .await
+            .map_err(Error::UnableToSend)?;
 
-            // If we're supposed to close the connection after sending
-            // the response, hold onto it for an arbitrary but relatively
-            // short amount of time, to ensure the entire response makes
-            // it through the protocol stack and transmitted to the client.
-            //
-            // TODO: It might not actually necessary to do this.  It all
-            // depends on how the protocol stack, operating system, and
-            // Rust libraries handle the socket and any data associated
-            // with it that the client still hasn't received at the moment
-            // the underlying `TcpStream` is dropped.
-            //
-            // A compromise might be to close the connection if either of the
-            // following happens first:
-            //
-            // 1. The client closes their end (we get a read output of 0 bytes,
-            //    in other words, EOF).
-            // 2. Some arbitrary grace period elapses (like 5 seconds).
-            //
-            // Otherwise, put the connection back so it can be reused for the
-            // next request at the top of the loop.
-            if close_after_response {
-                async_std::future::timeout(
-                    std::time::Duration::from_secs(5),
-                    futures::future::pending::<()>(),
-                )
-                .await
-                .unwrap_or(());
-                return Ok(());
-            } else {
-                connection_origin.replace(connection);
-            }
-        } else {
+        // If we're supposed to close the connection after sending
+        // the response, hold onto it for an arbitrary but relatively
+        // short amount of time, to ensure the entire response makes
+        // it through the protocol stack and transmitted to the client.
+        //
+        // TODO: It might not actually necessary to do this.  It all
+        // depends on how the protocol stack, operating system, and
+        // Rust libraries handle the socket and any data associated
+        // with it that the client still hasn't received at the moment
+        // the underlying `TcpStream` is dropped.
+        //
+        // A compromise might be to close the connection if either of the
+        // following happens first:
+        //
+        // 1. The client closes their end (we get a read output of 0 bytes,
+        //    in other words, EOF).
+        // 2. Some arbitrary grace period elapses (like 5 seconds).
+        //
+        // Otherwise, put the connection back so it can be reused for the
+        // next request at the top of the loop.
+        if close_after_response {
+            async_std::future::timeout(
+                std::time::Duration::from_secs(5),
+                futures::future::pending::<()>(),
+            )
+            .await
+            .unwrap_or(());
             return Ok(());
+        } else {
+            connection_origin.replace(connection);
         }
     }
 }
