@@ -21,7 +21,6 @@ use std::{
 fn handle_request(
     _request: Request,
     connection: Box<dyn Connection>,
-    _trailer: Vec<u8>,
 ) -> ResourceFuture {
     async {
         let mut response = Response::new();

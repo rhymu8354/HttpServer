@@ -56,7 +56,7 @@ pub struct FetchResults {
 pub type ResourceFuture =
     Pin<Box<dyn Future<Output = FetchResults> + Send + 'static>>;
 
-type ResourceHandler = dyn Fn(Request, Box<dyn Connection>, Vec<u8>) -> ResourceFuture
+type ResourceHandler = dyn Fn(Request, Box<dyn Connection>) -> ResourceFuture
     + Send
     + Sync
     + Unpin
@@ -183,10 +183,10 @@ enum ProcessorKind {
 type Processor = Pin<Box<dyn Future<Output = ProcessorKind> + Send>>;
 
 async fn receive_request(
-    connection: &mut dyn Connection
+    connection: &mut dyn Connection,
+    mut receive_buffer: Vec<u8>,
 ) -> Result<(Request, Vec<u8>), Error> {
     let mut request = Request::new();
-    let mut receive_buffer = Vec::new();
     loop {
         let left_over = receive_buffer.len();
         receive_buffer.resize(left_over + 65536, 0);
@@ -213,12 +213,19 @@ async fn handle_connection(
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) -> Result<(), Error> {
     let mut connection_origin = Some(connection);
+    let mut left_overs = Some(Vec::new());
     loop {
         // Assemble HTTP request from incoming data.
         let mut connection = connection_origin
             .take()
             .expect("we somehow dropped the connection");
-        let (request, trailer) = receive_request(&mut connection).await?;
+        let (request, trailer) = receive_request(
+            &mut connection,
+            left_overs
+                .take()
+                .expect("we somehow dropped the left-overs buffer"),
+        )
+        .await?;
 
         // Peek into the request to see if we should close this connection
         // after the response has been sent.
@@ -235,7 +242,7 @@ async fn handle_connection(
             .map(Clone::clone);
         let (mut response, mut connection) =
             if let Some(handler_factory) = handler_factory_reference {
-                let handler = handler_factory(request, connection, trailer);
+                let handler = handler_factory(request, connection);
                 let mut fetch_results = handler.await;
                 if !fetch_results.response.body.is_empty() {
                     fetch_results.response.headers.set_header(
@@ -297,8 +304,13 @@ async fn handle_connection(
             .await
             .unwrap_or(());
             return Ok(());
+        } else if response.status_code == 101 {
+            // TODO: Here is where we would give the connection to the resource
+            // handler somehow.
+            return Ok(());
         } else {
             connection_origin.replace(connection);
+            left_overs.replace(trailer);
         }
     }
 }
