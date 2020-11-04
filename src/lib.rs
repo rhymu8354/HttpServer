@@ -436,7 +436,7 @@ async fn handle_messages(
     // Drive to completion the stream of messages to the worker thread.
     println!("handle_messages: processing messages");
     work_in_receiver
-        // The special `Stop` message completes the stream.
+        // The special `Exit` message completes the stream.
         .take_while(|message| future::ready(!matches!(message, WorkerMessage::Exit)))
         .for_each(|message| async {
             match message {
