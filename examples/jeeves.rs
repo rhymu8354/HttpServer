@@ -45,7 +45,7 @@ async fn main_async() {
         &[b"".to_vec(), b"foo".to_vec()][..],
         Arc::new(handle_request_factory),
     );
-    match server.start(8080, false).await {
+    match server.start(8080, std::convert::identity).await {
         Ok(()) => futures::future::pending().await,
         Err(error) => {
             match error.source() {

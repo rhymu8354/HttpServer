@@ -50,6 +50,9 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Connection for T {}
 
 pub type OnUpgradedCallback = dyn FnOnce(Box<dyn Connection>) + Send;
 
+pub type ConnectionWrapper =
+    dyn Fn(Box<dyn Connection>) -> Box<dyn Connection> + Send + 'static;
+
 pub struct FetchResults {
     pub response: Response,
     pub connection: Box<dyn Connection>,
@@ -72,6 +75,7 @@ enum WorkerMessage {
     StartListening {
         listener: TcpListener,
         result_sender: oneshot::Sender<Result<(), Error>>,
+        connection_wrapper: Box<ConnectionWrapper>,
     },
 
     RegisterHandler {
@@ -81,7 +85,10 @@ enum WorkerMessage {
 }
 
 enum ListenerMessage {
-    Start(TcpListener),
+    Start {
+        listener: TcpListener,
+        connection_wrapper: Box<ConnectionWrapper>,
+    },
     // Stop,
 }
 
@@ -96,6 +103,8 @@ async fn accept_connections(
     //   previous listeners that might still be there).
     println!("accept_connections: entered");
     let listener: RefCell<Option<TcpListener>> = RefCell::new(None);
+    let connection_wrapper: RefCell<Option<Box<ConnectionWrapper>>> =
+        RefCell::new(None);
     loop {
         let accepter = async {
             // This future should only do something and complete if we have
@@ -120,15 +129,24 @@ async fn accept_connections(
                     if listener.borrow().is_none() {
                         listener.replace(Some(current_listener));
                     }
+                    let mut connection: Box<dyn Connection> =
+                        Box::new(connection);
+                    let current_connection_wrapper =
+                        connection_wrapper.borrow_mut().take();
+                    if let Some(current_connection_wrapper) =
+                        current_connection_wrapper
+                    {
+                        connection = current_connection_wrapper(connection);
+                        connection_wrapper
+                            .replace(Some(current_connection_wrapper));
+                    }
                     // This should never fail because the connection receiver
                     // never completes.  Each connection will be at least
                     // accepted by the processor future constructed to
                     // handle it.
-                    connection_sender
-                        .unbounded_send(Box::new(connection))
-                        .expect(
-                            "connection dropped before it reached a processor",
-                        );
+                    connection_sender.unbounded_send(connection).expect(
+                        "connection dropped before it reached a processor",
+                    );
                 } else {
                     // TODO: This happens if the listener breaks somehow.
                     // We should set up a mechanism for reporting this.
@@ -151,7 +169,10 @@ async fn accept_connections(
             // constantly
             println!("accept_connections: Waiting for messages");
             match listener_receiver.next().await {
-                Some(ListenerMessage::Start(new_listener)) => {
+                Some(ListenerMessage::Start {
+                    listener: new_listener,
+                    connection_wrapper: new_connection_wrapper,
+                }) => {
                     println!(
                         "accept_connections: Now accepting connections on port {}",
                         new_listener.local_addr().expect(
@@ -159,6 +180,7 @@ async fn accept_connections(
                         ).port()
                     );
                     listener.replace(Some(new_listener));
+                    connection_wrapper.replace(Some(new_connection_wrapper));
                 },
                 None => futures::future::pending().await,
             }
@@ -447,6 +469,7 @@ async fn handle_messages(
                 WorkerMessage::StartListening {
                     listener,
                     result_sender,
+                    connection_wrapper,
                 } => {
                     println!("handle_messages: got StartListening message");
                     // It's possible for the `send` here to fail, if the user
@@ -464,7 +487,10 @@ async fn handle_messages(
                             // This should never fail because `accept_connections`,
                             // which holds the receiver, never drops the receiver.
                             listener_sender
-                                .unbounded_send(ListenerMessage::Start(listener))
+                                .unbounded_send(ListenerMessage::Start{
+                                    listener,
+                                    connection_wrapper
+                                })
                                 .expect("listener dropped before it reached the connection accepter");
                             Ok(())
                         })
@@ -550,11 +576,14 @@ impl HttpServer {
             .expect("worker message dropped before it could reach the worker");
     }
 
-    pub async fn start(
+    pub async fn start<W>(
         &mut self,
         port: u16,
-        _use_tls: bool,
-    ) -> Result<(), Error> {
+        connection_wrapper: W,
+    ) -> Result<(), Error>
+    where
+        W: Fn(Box<dyn Connection>) -> Box<dyn Connection> + Send + 'static,
+    {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
             .await
             .map_err(Error::Bind)?;
@@ -567,6 +596,7 @@ impl HttpServer {
             .unbounded_send(WorkerMessage::StartListening {
                 listener,
                 result_sender,
+                connection_wrapper: Box::new(connection_wrapper),
             })
             .expect("worker message dropped before it could reach the worker");
         // It shouldn't be possible for this to fail, since the worker will
