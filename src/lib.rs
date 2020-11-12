@@ -279,13 +279,7 @@ async fn handle_connection(
         let (mut response, mut connection, on_upgraded) =
             if let Some(handler_factory) = handler_factory_reference {
                 let handler = handler_factory(request, connection);
-                let mut fetch_results = handler.await;
-                if !fetch_results.response.body.is_empty() {
-                    fetch_results.response.headers.set_header(
-                        "Content-Length",
-                        fetch_results.response.body.len().to_string(),
-                    );
-                }
+                let fetch_results = handler.await;
                 (
                     fetch_results.response,
                     fetch_results.connection,
@@ -295,12 +289,23 @@ async fn handle_connection(
                 let mut response = Response::new();
                 response.status_code = 404;
                 response.reason_phrase = "Not Found".into();
-                response.headers.set_header("Content-Length", "0");
                 (response, connection, None)
             };
 
         // Add standard headers.
         response.headers.set_header("Server", &server_info);
+
+        // Set `Content-Length` header if there is no transfer encoding, as
+        // long as there is a body or the connection will be reused for another
+        // request.
+        if !response.headers.has_header("Transfer-Encoding")
+            && (!response.body.is_empty()
+                || (!close_after_response && response.status_code != 101))
+        {
+            response
+                .headers
+                .set_header("Content-Length", response.body.len().to_string());
+        }
 
         // If we're supposed to close the connection after sending
         // the response, tell the client so via the "close" token
