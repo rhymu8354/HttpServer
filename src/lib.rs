@@ -94,7 +94,8 @@ enum ListenerMessage {
 
 async fn accept_connections(
     mut listener_receiver: mpsc::UnboundedReceiver<ListenerMessage>,
-    connection_sender: mpsc::UnboundedSender<Box<dyn Connection>>,
+    connection_sender: mpsc::UnboundedSender<ConnectionInfo>,
+    server_info: &str,
 ) {
     // Listener is in a `RefCell` because two separate futures need to access
     // it:
@@ -144,9 +145,14 @@ async fn accept_connections(
                     // never completes.  Each connection will be at least
                     // accepted by the processor future constructed to
                     // handle it.
-                    connection_sender.unbounded_send(connection).expect(
-                        "connection dropped before it reached a processor",
-                    );
+                    connection_sender
+                        .unbounded_send(ConnectionInfo {
+                            connection,
+                            server_info: String::from(server_info),
+                        })
+                        .expect(
+                            "connection dropped before it reached a processor",
+                        );
                 } else {
                     // TODO: This happens if the listener breaks somehow.
                     // We should set up a mechanism for reporting this.
@@ -192,13 +198,18 @@ async fn accept_connections(
     }
 }
 
+struct ConnectionInfo {
+    connection: Box<dyn Connection>,
+    server_info: String,
+}
+
 // This is the type of value returned by a completed future selected by
 // `accept_connections`.  It's used to tell the difference between a future
 // which processed a connection from a future which processed the connection
 // receiver.
 enum ProcessorKind {
     Connection,
-    Receiver(mpsc::UnboundedReceiver<Box<dyn Connection>>),
+    Receiver(mpsc::UnboundedReceiver<ConnectionInfo>),
 }
 
 type Processor = Pin<Box<dyn Future<Output = ProcessorKind> + Send>>;
@@ -230,9 +241,13 @@ async fn receive_request(
 }
 
 async fn handle_connection(
-    connection: Box<dyn Connection>,
+    connection_info: ConnectionInfo,
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) -> Result<(), Error> {
+    let ConnectionInfo {
+        connection,
+        server_info,
+    } = connection_info;
     let mut connection_origin = Some(connection);
     let mut left_overs = Some(Vec::new());
     loop {
@@ -280,8 +295,12 @@ async fn handle_connection(
                 let mut response = Response::new();
                 response.status_code = 404;
                 response.reason_phrase = "Not Found".into();
+                response.headers.set_header("Content-Length", "0");
                 (response, connection, None)
             };
+
+        // Add standard headers.
+        response.headers.set_header("Server", &server_info);
 
         // If we're supposed to close the connection after sending
         // the response, tell the client so via the "close" token
@@ -342,7 +361,7 @@ async fn handle_connection(
 }
 
 async fn await_next_connection(
-    mut connection_receiver: mpsc::UnboundedReceiver<Box<dyn Connection>>,
+    mut connection_receiver: mpsc::UnboundedReceiver<ConnectionInfo>,
     processors: Arc<Mutex<Vec<Processor>>>,
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) -> ProcessorKind {
@@ -385,7 +404,7 @@ async fn await_next_connection(
 }
 
 async fn handle_connections(
-    connection_receiver: mpsc::UnboundedReceiver<Box<dyn Connection>>,
+    connection_receiver: mpsc::UnboundedReceiver<ConnectionInfo>,
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) {
     let processors = Arc::new(Mutex::new(Vec::new()));
@@ -511,7 +530,10 @@ async fn handle_messages(
     println!("handle_messages: exiting");
 }
 
-async fn worker(work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>) {
+async fn worker(
+    work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>,
+    server_info: String,
+) {
     // These channels are used to pass values between the various
     // sub-tasks below.
     // * listener sender/receiver passes TcpListener values from
@@ -531,7 +553,7 @@ async fn worker(work_in_receiver: mpsc::UnboundedReceiver<WorkerMessage>) {
             handlers.clone(),
         ).fuse() => (),
 
-        () = accept_connections(listener_receiver, connection_sender).fuse() => (),
+        () = accept_connections(listener_receiver, connection_sender, &server_info).fuse() => (),
 
         () = handle_connections(connection_receiver, handlers).fuse() => (),
     );
@@ -547,16 +569,20 @@ pub struct HttpServer {
 
 impl HttpServer {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new<T>(server_info: T) -> Self
+    where
+        T: Into<String>,
+    {
         // Make the channel used to communicate with the worker thread.
         let (sender, receiver) = mpsc::unbounded();
 
         // Store the sender end of the channel and spawn the worker thread,
         // giving it the receiver end as well as the TCP listener.
+        let server_info = server_info.into();
         Self {
             work_in: sender,
             worker: Some(thread::spawn(|| {
-                executor::block_on(worker(receiver))
+                executor::block_on(worker(receiver, server_info))
             })),
         }
     }
@@ -606,12 +632,6 @@ impl HttpServer {
         result_receiver
             .await
             .expect("unable to receive result back from worker")
-    }
-}
-
-impl Default for HttpServer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

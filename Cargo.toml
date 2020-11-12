@@ -18,3 +18,4 @@ thiserror = "1.0"
 
 [dev-dependencies]
 async-ctrlc = "1.2"
+structopt = "0.3"

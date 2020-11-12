@@ -17,6 +17,7 @@ use std::{
     error::Error as _,
     sync::Arc,
 };
+use structopt::StructOpt;
 
 fn handle_request_factory(
     _request: Request,
@@ -39,13 +40,21 @@ fn handle_request_factory(
     .boxed()
 }
 
+#[derive(Clone, StructOpt)]
+struct Opts {
+    /// URI of resource to request
+    #[structopt(default_value = "8080")]
+    port: u16,
+}
+
 async fn main_async() {
-    let mut server = HttpServer::new();
+    let opts: Opts = Opts::from_args();
+    let mut server = HttpServer::new("jeeves");
     server.register(
         &[b"".to_vec(), b"foo".to_vec()][..],
         Arc::new(handle_request_factory),
     );
-    match server.start(8080, std::convert::identity).await {
+    match server.start(opts.port, std::convert::identity).await {
         Ok(()) => futures::future::pending().await,
         Err(error) => {
             match error.source() {
