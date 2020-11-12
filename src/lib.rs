@@ -37,6 +37,7 @@ use std::{
     collections::HashMap,
     error::Error as _,
     future::Future,
+    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc,
@@ -102,7 +103,6 @@ async fn accept_connections(
     // * `accepter` takes the listener, uses it, and potentially puts it back.
     // * `message_handler` places new listeners there (potentially dropping any
     //   previous listeners that might still be there).
-    println!("accept_connections: entered");
     let listener: RefCell<Option<TcpListener>> = RefCell::new(None);
     let connection_wrapper: RefCell<Option<Box<ConnectionWrapper>>> =
         RefCell::new(None);
@@ -119,7 +119,6 @@ async fn accept_connections(
                 // "run this future again" (technically a new future is made
                 // with this same async block) we can take the listener back
                 // out.
-                println!("accept_connections: Accepting next connection");
                 if let Ok((connection, address)) =
                     current_listener.accept().await
                 {
@@ -147,6 +146,7 @@ async fn accept_connections(
                     // handle it.
                     connection_sender
                         .unbounded_send(ConnectionInfo {
+                            address,
                             connection,
                             server_info: String::from(server_info),
                         })
@@ -173,7 +173,6 @@ async fn accept_connections(
             // told to exit.  In that case, we don't want to loop trying to get
             // the next message here, because it would either panic or
             // constantly
-            println!("accept_connections: Waiting for messages");
             match listener_receiver.next().await {
                 Some(ListenerMessage::Start {
                     listener: new_listener,
@@ -199,6 +198,7 @@ async fn accept_connections(
 }
 
 struct ConnectionInfo {
+    address: SocketAddr,
     connection: Box<dyn Connection>,
     server_info: String,
 }
@@ -209,10 +209,11 @@ struct ConnectionInfo {
 // receiver.
 enum ProcessorKind {
     Connection,
-    Receiver(mpsc::UnboundedReceiver<ConnectionInfo>),
+    Receiver {
+        receiver: mpsc::UnboundedReceiver<ConnectionInfo>,
+        connection_info: ConnectionInfo,
+    },
 }
-
-type Processor = Pin<Box<dyn Future<Output = ProcessorKind> + Send>>;
 
 async fn receive_request(
     connection: &mut dyn Connection,
@@ -245,6 +246,7 @@ async fn handle_connection(
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) -> Result<(), Error> {
     let ConnectionInfo {
+        address,
         connection,
         server_info,
     } = connection_info;
@@ -271,6 +273,7 @@ async fn handle_connection(
         // Dispatch request to handler (use default "not
         // found" handler if we can't find one) to produce an HTTP
         // response.
+        let request_id = format!("{} {}", request.method, request.target);
         let handler_factory_reference = handlers
             .lock()
             .expect("")
@@ -291,6 +294,14 @@ async fn handle_connection(
                 response.reason_phrase = "Not Found".into();
                 (response, connection, None)
             };
+        println!(
+            "{}: {} - {} {} ({} bytes)",
+            address,
+            request_id,
+            response.status_code,
+            response.reason_phrase,
+            response.body.len()
+        );
 
         // Add standard headers.
         response.headers.set_header("Server", &server_info);
@@ -366,53 +377,32 @@ async fn handle_connection(
 }
 
 async fn await_next_connection(
-    mut connection_receiver: mpsc::UnboundedReceiver<ConnectionInfo>,
-    processors: Arc<Mutex<Vec<Processor>>>,
-    handlers: Arc<Mutex<ResourceHandlerCollection>>,
+    mut receiver: mpsc::UnboundedReceiver<ConnectionInfo>
 ) -> ProcessorKind {
     // Wait for the next connection to come in.
     //
-    // If `connection_receiver` completes (has no next), it means
+    // If `receiver` completes (has no next), it means
     // the sender end, which is held by `accept_connections`, was
     // dropped somehow.  This should never happen, since that
     // future never completes.
-    let next_connection = connection_receiver.next();
-    let connection = next_connection.await.expect(
+    let next_connection = receiver.next();
+    let connection_info = next_connection.await.expect(
         "this task receives connections from other task which should never complete"
-    );
-    let handlers_ref = handlers.clone();
-    processors.lock().expect("last thread that held processors panicked").push(
-        async {
-            // Assemble HTTP request from incoming data.
-            if let Err(error) =
-                handle_connection(connection, handlers_ref).await
-            {
-                // TODO: We probably want better error reporting up to
-                // the owner of this server, rather than printing to
-                // standard error stream like a pleb.
-                match error.source() {
-                    Some(source) => eprintln!("error: {} ({})", error, source),
-                    None => eprintln!("error: {}", error),
-                };
-            };
-
-            // The output indicates that this is the future used
-            // to receive the next connection.
-            ProcessorKind::Connection
-        }
-        .boxed(),
     );
 
     // The output indicates that this is the future used
     // to receive the next connection.
-    ProcessorKind::Receiver(connection_receiver)
+    ProcessorKind::Receiver {
+        receiver,
+        connection_info,
+    }
 }
 
 async fn handle_connections(
     connection_receiver: mpsc::UnboundedReceiver<ConnectionInfo>,
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) {
-    let processors = Arc::new(Mutex::new(Vec::new()));
+    let mut processors = Vec::new();
     let mut needs_next_connection = true;
 
     // We need to wrap `connection_receiver` in an Option because we need to
@@ -432,33 +422,62 @@ async fn handle_connections(
                 connection_receiver.take().expect(
                     "somehow we fumbled the connection receiver between connections"
                 ),
-                processors.clone(),
-                handlers.clone(),
             )
             .boxed();
 
             // Add the "next connection" future to our collection.
-            processors
-                .lock()
-                .expect("last thread that held processors panicked")
-                .push(next_connection);
+            processors.push(next_connection);
         }
 
         // Wait until a connection or the "connection receiver" completes.
-        let processors_in = std::mem::take(
-            &mut *processors
-                .lock()
-                .expect("last thread that held processors panicked"),
-        );
-        let (processor_kind, _, processors_out) =
+        let processors_in = processors;
+        let (processor_kind, _, mut processors_out) =
             future::select_all(processors_in).await;
 
         // If it was the "connection receiver" future which completed, mark
         // that we will need to make a new one for the next loop.
         match processor_kind {
-            ProcessorKind::Receiver(new_connection_receiver) => {
+            ProcessorKind::Receiver {
+                receiver: new_connection_receiver,
+                connection_info,
+            } => {
                 connection_receiver.replace(new_connection_receiver);
                 needs_next_connection = true;
+                let handlers_ref = handlers.clone();
+                processors_out.push(
+                    async {
+                        // Receive requests from the client and send back
+                        // responses, until either the connection is closed or
+                        // the connection is upgraded to another protocol.
+                        let address = connection_info.address;
+                        if let Err(error) =
+                            handle_connection(connection_info, handlers_ref)
+                                .await
+                        {
+                            // TODO: We probably want better error reporting
+                            // up to
+                            // the owner of this server, rather than
+                            // printing to
+                            // standard error stream like a pleb.
+                            match error.source() {
+                                Some(source) => eprintln!(
+                                    "{}: error: {} ({})",
+                                    address, error, source
+                                ),
+                                None => {
+                                    eprintln!("{}: error: {}", address, error)
+                                },
+                            };
+                        };
+                        println!("{}: connection dropped", address);
+
+                        // The output indicates that this is a future used to
+                        // receive requests from a client and send back
+                        // responses.
+                        ProcessorKind::Connection
+                    }
+                    .boxed(),
+                );
             },
             ProcessorKind::Connection => {
                 needs_next_connection = false;
@@ -467,10 +486,7 @@ async fn handle_connections(
 
         // All incomplete futures go back to be collected next loop.
         // We may have received new ones too, so combine them.
-        processors
-            .lock()
-            .expect("last thread that held processors panicked")
-            .extend(processors_out);
+        processors = processors_out;
     }
 }
 
@@ -480,7 +496,6 @@ async fn handle_messages(
     handlers: Arc<Mutex<ResourceHandlerCollection>>,
 ) {
     // Drive to completion the stream of messages to the worker thread.
-    println!("handle_messages: processing messages");
     work_in_receiver
         // The special `Exit` message completes the stream.
         .take_while(|message| future::ready(!matches!(message, WorkerMessage::Exit)))
@@ -495,19 +510,12 @@ async fn handle_messages(
                     result_sender,
                     connection_wrapper,
                 } => {
-                    println!("handle_messages: got StartListening message");
                     // It's possible for the `send` here to fail, if the user
                     // of the library gave up waiting for the result of
                     // starting the server.  In that case we just drop
                     // the result, since obviously they didn't care about it.
                     result_sender
                         .send({
-                            println!(
-                                "handle_messages: Now listening for connections on port {}.",
-                                listener.local_addr().expect(
-                                    "we should have been able to figure out our own address"
-                                ).port()
-                            );
                             // This should never fail because `accept_connections`,
                             // which holds the receiver, never drops the receiver.
                             listener_sender
@@ -532,7 +540,6 @@ async fn handle_messages(
             }
         })
         .await;
-    println!("handle_messages: exiting");
 }
 
 async fn worker(
