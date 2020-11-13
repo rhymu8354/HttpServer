@@ -11,8 +11,12 @@ mod error;
 use async_std::net::{
     Ipv4Addr,
     TcpListener,
+    TcpStream,
 };
-pub use error::Error;
+pub use error::{
+    ConnectionWrapper as ConnectionWrapperError,
+    Error,
+};
 use futures::{
     channel::{
         mpsc,
@@ -51,8 +55,14 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Connection for T {}
 
 pub type OnUpgradedCallback = dyn FnOnce(Box<dyn Connection>) + Send;
 
+pub type ConnectionWrapperResult =
+    Result<Box<dyn Connection>, Box<ConnectionWrapperError>>;
+
+pub type ConnectionWrapFuture =
+    Pin<Box<dyn Future<Output = ConnectionWrapperResult> + Send + 'static>>;
+
 pub type ConnectionWrapper =
-    dyn Fn(Box<dyn Connection>) -> Box<dyn Connection> + Send + 'static;
+    dyn Fn(Box<dyn Connection>) -> ConnectionWrapFuture + Send + 'static;
 
 pub struct FetchResults {
     pub response: Response,
@@ -93,6 +103,41 @@ enum ListenerMessage {
     // Stop,
 }
 
+async fn accept_connection(
+    connection: TcpStream,
+    address: SocketAddr,
+    connection_wrapper: &RefCell<Option<Box<ConnectionWrapper>>>,
+    connection_sender: &mpsc::UnboundedSender<ConnectionInfo>,
+    server_info: &str,
+) -> Result<(), Error> {
+    let mut connection: Box<dyn Connection> = Box::new(connection);
+    // NOTE: `Option::take` is called directly rather than calling `take`
+    // on the option, in order to avoid a false error detection by
+    // rust-analyzer.  Try going back to calling `take` on the option
+    // once whatever bug is in rust-analyzer is fixed.
+    let current_connection_wrapper =
+        Option::take(&mut connection_wrapper.borrow_mut());
+    if let Some(current_connection_wrapper) = current_connection_wrapper {
+        let connection_wrapping_result =
+            current_connection_wrapper(connection).await;
+        connection_wrapper.replace(Some(current_connection_wrapper));
+        connection = connection_wrapping_result
+            .map_err(|error| Error::ConnectionWrapper(error))?;
+    }
+    // This should never fail because the connection receiver
+    // never completes.  Each connection will be at least
+    // accepted by the processor future constructed to
+    // handle it.
+    connection_sender
+        .unbounded_send(ConnectionInfo {
+            address,
+            connection,
+            server_info: String::from(server_info),
+        })
+        .expect("connection dropped before it reached a processor");
+    Ok(())
+}
+
 async fn accept_connections(
     mut listener_receiver: mpsc::UnboundedReceiver<ListenerMessage>,
     connection_sender: mpsc::UnboundedSender<ConnectionInfo>,
@@ -122,37 +167,30 @@ async fn accept_connections(
                 if let Ok((connection, address)) =
                     current_listener.accept().await
                 {
+                    if listener.borrow().is_none() {
+                        listener.replace(Some(current_listener));
+                    }
                     println!(
                         "accept_connections: Connection received from {}",
                         address
                     );
-                    if listener.borrow().is_none() {
-                        listener.replace(Some(current_listener));
-                    }
-                    let mut connection: Box<dyn Connection> =
-                        Box::new(connection);
-                    let current_connection_wrapper =
-                        connection_wrapper.borrow_mut().take();
-                    if let Some(current_connection_wrapper) =
-                        current_connection_wrapper
+                    if let Err(error) = accept_connection(
+                        connection,
+                        address,
+                        &connection_wrapper,
+                        &connection_sender,
+                        server_info,
+                    )
+                    .await
                     {
-                        connection = current_connection_wrapper(connection);
-                        connection_wrapper
-                            .replace(Some(current_connection_wrapper));
+                        match error.source() {
+                            Some(source) => eprintln!(
+                                "{}: error: {} ({})",
+                                address, error, source
+                            ),
+                            None => eprintln!("{}: error: {}", address, error),
+                        };
                     }
-                    // This should never fail because the connection receiver
-                    // never completes.  Each connection will be at least
-                    // accepted by the processor future constructed to
-                    // handle it.
-                    connection_sender
-                        .unbounded_send(ConnectionInfo {
-                            address,
-                            connection,
-                            server_info: String::from(server_info),
-                        })
-                        .expect(
-                            "connection dropped before it reached a processor",
-                        );
                 } else {
                     // TODO: This happens if the listener breaks somehow.
                     // We should set up a mechanism for reporting this.
@@ -454,11 +492,9 @@ async fn handle_connections(
                             handle_connection(connection_info, handlers_ref)
                                 .await
                         {
-                            // TODO: We probably want better error reporting
-                            // up to
-                            // the owner of this server, rather than
-                            // printing to
-                            // standard error stream like a pleb.
+                            // TODO: We probably want better error reporting up
+                            // to the owner of this server, rather than
+                            // printing to standard error stream like a pleb.
                             match error.source() {
                                 Some(source) => eprintln!(
                                     "{}: error: {} ({})",
@@ -614,13 +650,13 @@ impl HttpServer {
             .expect("worker message dropped before it could reach the worker");
     }
 
-    pub async fn start<W>(
+    pub async fn start_with_connection_wrapper<W>(
         &mut self,
         port: u16,
         connection_wrapper: W,
     ) -> Result<(), Error>
     where
-        W: Fn(Box<dyn Connection>) -> Box<dyn Connection> + Send + 'static,
+        W: Fn(Box<dyn Connection>) -> ConnectionWrapFuture + Send + 'static,
     {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
             .await
@@ -644,6 +680,16 @@ impl HttpServer {
         result_receiver
             .await
             .expect("unable to receive result back from worker")
+    }
+
+    pub async fn start(
+        &mut self,
+        port: u16,
+    ) -> Result<(), Error> {
+        self.start_with_connection_wrapper(port, |connection| {
+            async { Ok(connection) }.boxed()
+        })
+        .await
     }
 }
 

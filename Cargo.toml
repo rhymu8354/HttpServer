@@ -17,5 +17,8 @@ rhymuweb = "1.0"
 thiserror = "1.0"
 
 [dev-dependencies]
+anyhow = "1.0"
 async-ctrlc = "1.2"
+async-tls = "0.10"
+rustls = "0.18"
 structopt = "0.3"

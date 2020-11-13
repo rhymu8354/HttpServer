@@ -1,3 +1,5 @@
+pub type ConnectionWrapper = dyn std::error::Error + Send + Sync + 'static;
+
 /// This is the enumeration of all the different kinds of errors which this
 /// crate generates.
 #[derive(Debug, thiserror::Error)]
@@ -32,4 +34,9 @@ pub enum Error {
     /// response to the client.
     #[error("unable to send response to client")]
     UnableToSend(#[source] std::io::Error),
+
+    /// The server encountered an error attempting to wrap a new
+    /// client connection.
+    #[error("unable to wrap connection to client")]
+    ConnectionWrapper(#[source] Box<ConnectionWrapper>),
 }
