@@ -229,8 +229,8 @@ async fn accept_connections(
             }
         };
         futures::select!(
-            () = accepter.fuse() => (),
-            () = message_handler.fuse() => (),
+            () = accepter.fuse() => {},
+            () = message_handler.fuse() => {},
         );
     }
 }
@@ -599,11 +599,11 @@ async fn worker(
             work_in_receiver,
             listener_sender,
             handlers.clone(),
-        ).fuse() => (),
+        ).fuse() => {},
 
-        () = accept_connections(listener_receiver, connection_sender, &server_info).fuse() => (),
+        () = accept_connections(listener_receiver, connection_sender, &server_info).fuse() => {},
 
-        () = handle_connections(connection_receiver, handlers).fuse() => (),
+        () = handle_connections(connection_receiver, handlers).fuse() => {},
     );
 }
 
