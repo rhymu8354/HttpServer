@@ -24,6 +24,7 @@ use futures::{
     },
     executor,
     future,
+    future::BoxFuture,
     AsyncRead,
     AsyncReadExt,
     AsyncWrite,
@@ -40,9 +41,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     error::Error as _,
-    future::Future,
     net::SocketAddr,
-    pin::Pin,
     sync::{
         Arc,
         Mutex,
@@ -58,8 +57,7 @@ pub type OnUpgradedCallback = dyn FnOnce(Box<dyn Connection>) + Send;
 pub type ConnectionWrapperResult =
     Result<Box<dyn Connection>, Box<ConnectionWrapperError>>;
 
-pub type ConnectionWrapFuture =
-    Pin<Box<dyn Future<Output = ConnectionWrapperResult> + Send + 'static>>;
+pub type ConnectionWrapFuture = BoxFuture<'static, ConnectionWrapperResult>;
 
 pub type ConnectionWrapper =
     dyn Fn(Box<dyn Connection>) -> ConnectionWrapFuture + Send + 'static;
@@ -70,7 +68,7 @@ pub struct FetchResults {
     pub on_upgraded: Option<Box<OnUpgradedCallback>>,
 }
 
-pub type ResourceFuture = Pin<Box<dyn Future<Output = FetchResults> + Send>>;
+pub type ResourceFuture = BoxFuture<'static, FetchResults>;
 
 type ResourceHandler =
     dyn Fn(Request, Box<dyn Connection>) -> ResourceFuture + Send + Sync;
