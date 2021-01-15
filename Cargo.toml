@@ -11,7 +11,7 @@ keywords = ["http", "server"]
 repository = "https://github.com/rhymu8354/HttpServer.git"
 
 [dependencies]
-async-std = "1.6"
+async-std = "1.9"
 futures = "0.3"
 rhymuweb = "1.1"
 thiserror = "1.0"
