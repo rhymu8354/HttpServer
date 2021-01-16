@@ -13,7 +13,7 @@ repository = "https://github.com/rhymu8354/HttpServer.git"
 [dependencies]
 async-std = "1.9"
 futures = "0.3"
-rhymuweb = "1.1"
+rhymuweb = "1.2"
 thiserror = "1.0"
 
 [dev-dependencies]
