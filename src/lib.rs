@@ -656,6 +656,10 @@ impl HttpServer {
     where
         W: Fn(Box<dyn Connection>) -> ConnectionWrapFuture + Send + 'static,
     {
+        // TODO:
+        // * Allow the user to select local address.
+        // * Either support "dual stack" or let user select multiple local
+        //   addresses.
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
             .await
             .map_err(Error::Bind)?;
