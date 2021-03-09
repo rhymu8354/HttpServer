@@ -8,6 +8,10 @@ use futures::{
     future::FutureExt,
     select,
 };
+use log::{
+    error,
+    info,
+};
 use rhymuweb::{
     Request,
     Response,
@@ -27,6 +31,7 @@ use rustls::{
     },
     NoClientAuth,
 };
+use simple_logger::SimpleLogger;
 use std::{
     fs::File,
     io::BufReader,
@@ -73,6 +78,10 @@ struct Opts {
     /// SSL private key (if TLS is enabled)
     #[structopt(long, default_value = "key.pem")]
     key: PathBuf,
+
+    /// Lowest level of log messages to capture and output.
+    #[structopt(short = "l", long = "log", default_value = "Info")]
+    log_level: log::LevelFilter,
 }
 
 fn load_tls_config(
@@ -141,7 +150,12 @@ async fn run_server() -> anyhow::Result<()> {
         tls,
         cert,
         key,
+        log_level,
     } = Opts::from_args();
+    SimpleLogger::new()
+        .with_level(log_level)
+        .init()
+        .context("Unable to set up logger")?;
     let mut server = HttpServer::new("jeeves");
     server.register(
         &[b"".to_vec(), b"foo".to_vec()][..],
@@ -157,7 +171,7 @@ async fn run_server() -> anyhow::Result<()> {
 
 async fn main_async() {
     if let Err(error) = run_server().await {
-        eprintln!("{:?}", error);
+        error!("{:?}", error);
     }
 }
 
@@ -166,7 +180,7 @@ fn main() {
         select!(
             () = main_async().fuse() => {},
             () = CtrlC::new().unwrap().fuse() => {
-                println!("(Ctrl+C pressed; aborted)");
+                info!("(Ctrl+C pressed; aborted)");
             },
         )
     });

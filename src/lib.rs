@@ -32,6 +32,10 @@ use futures::{
     FutureExt,
     StreamExt,
 };
+use log::{
+    error,
+    info,
+};
 use rhymuweb::{
     Request,
     RequestParseStatus,
@@ -40,7 +44,6 @@ use rhymuweb::{
 use std::{
     cell::RefCell,
     collections::HashMap,
-    error::Error as _,
     net::SocketAddr,
     sync::{
         Arc,
@@ -82,9 +85,10 @@ enum WorkerMessage {
     // This tells the worker thread to start listening for incoming requests
     // from HTTP clients.
     StartListening {
-        listener: TcpListener,
-        result_sender: oneshot::Sender<Result<(), Error>>,
         connection_wrapper: Box<ConnectionWrapper>,
+        listener: TcpListener,
+        log_target: String,
+        result_sender: oneshot::Sender<Result<(), Error>>,
     },
 
     RegisterHandler {
@@ -96,6 +100,7 @@ enum WorkerMessage {
 enum ListenerMessage {
     Start {
         listener: TcpListener,
+        log_target: String,
         connection_wrapper: Box<ConnectionWrapper>,
     },
     // Stop,
@@ -104,24 +109,14 @@ enum ListenerMessage {
 async fn accept_connection(
     connection: TcpStream,
     address: SocketAddr,
-    connection_wrapper: &RefCell<Option<Box<ConnectionWrapper>>>,
+    connection_wrapper: &ConnectionWrapper,
     connection_sender: &mpsc::UnboundedSender<ConnectionInfo>,
-    server_info: &str,
+    server_info: String,
+    log_target: String,
 ) -> Result<(), Error> {
-    let mut connection: Box<dyn Connection> = Box::new(connection);
-    // NOTE: `Option::take` is called directly rather than calling `take`
-    // on the option, in order to avoid a false error detection by
-    // rust-analyzer.  Try going back to calling `take` on the option
-    // once whatever bug is in rust-analyzer is fixed.
-    let current_connection_wrapper =
-        Option::take(&mut connection_wrapper.borrow_mut());
-    if let Some(current_connection_wrapper) = current_connection_wrapper {
-        let connection_wrapping_result =
-            current_connection_wrapper(connection).await;
-        connection_wrapper.replace(Some(current_connection_wrapper));
-        connection = connection_wrapping_result
-            .map_err(|error| Error::ConnectionWrapper(error))?;
-    }
+    let connection = connection_wrapper(Box::new(connection))
+        .await
+        .map_err(|error| Error::ConnectionWrapper(error))?;
     // This should never fail because the connection receiver
     // never completes.  Each connection will be at least
     // accepted by the processor future constructed to
@@ -130,7 +125,8 @@ async fn accept_connection(
         .unbounded_send(ConnectionInfo {
             address,
             connection,
-            server_info: String::from(server_info),
+            log_target,
+            server_info,
         })
         .expect("connection dropped before it reached a processor");
     Ok(())
@@ -141,53 +137,55 @@ async fn accept_connections(
     connection_sender: mpsc::UnboundedSender<ConnectionInfo>,
     server_info: &str,
 ) {
-    // Listener is in a `RefCell` because two separate futures need to access
-    // it:
-    // * `accepter` takes the listener, uses it, and potentially puts it back.
-    // * `message_handler` places new listeners there (potentially dropping any
-    //   previous listeners that might still be there).
-    let listener: RefCell<Option<TcpListener>> = RefCell::new(None);
-    let connection_wrapper: RefCell<Option<Box<ConnectionWrapper>>> =
-        RefCell::new(None);
+    struct State {
+        connection_wrapper: Box<ConnectionWrapper>,
+        listener: TcpListener,
+        log_target: String,
+    }
+
+    // The `state` is in a `RefCell` because two separate futures need to
+    // access it:
+    // * `accepter` takes and uses it, potentially putting it back.
+    // * `message_handler` places new state there (potentially dropping any
+    //   previous state that might still be there).
+    let state = RefCell::<Option<State>>::new(None);
     loop {
         let accepter = async {
             // This future should only do something and complete if we have
             // a listener.  If we don't, we need the other future to complete,
             // and we have nothing to do here, so never complete.
-            let current_listener = listener.borrow_mut().take();
-            if let Some(current_listener) = current_listener {
+            let current_state = state.borrow_mut().take();
+            if let Some(current_state) = current_state {
                 // Here we wait on the listener for the next incoming
                 // connection from an HTTP client.  If we get a connection, we
-                // need to put the listener back so that when we loop back and
+                // need to put the state back so that when we loop back and
                 // "run this future again" (technically a new future is made
-                // with this same async block) we can take the listener back
+                // with this same async block) we can take the state back
                 // out.
                 if let Ok((connection, address)) =
-                    current_listener.accept().await
+                    current_state.listener.accept().await
                 {
-                    if listener.borrow().is_none() {
-                        listener.replace(Some(current_listener));
-                    }
-                    println!(
-                        "accept_connections: Connection received from {}",
-                        address
+                    info!(
+                        target: &current_state.log_target,
+                        "Connection received from {}", address
                     );
                     if let Err(error) = accept_connection(
                         connection,
                         address,
-                        &connection_wrapper,
+                        &current_state.connection_wrapper,
                         &connection_sender,
-                        server_info,
+                        server_info.to_owned(),
+                        current_state.log_target.clone(),
                     )
                     .await
                     {
-                        match error.source() {
-                            Some(source) => eprintln!(
-                                "{}: error: {} ({})",
-                                address, error, source
-                            ),
-                            None => eprintln!("{}: error: {}", address, error),
-                        };
+                        error!(
+                            target: &current_state.log_target,
+                            "{}: {:?}", address, error
+                        );
+                    }
+                    if state.borrow().is_none() {
+                        state.replace(Some(current_state));
                     }
                 } else {
                     // TODO: This happens if the listener breaks somehow.
@@ -211,17 +209,22 @@ async fn accept_connections(
             // constantly
             match listener_receiver.next().await {
                 Some(ListenerMessage::Start {
-                    listener: new_listener,
-                    connection_wrapper: new_connection_wrapper,
+                    connection_wrapper,
+                    listener,
+                    log_target,
                 }) => {
-                    println!(
-                        "accept_connections: Now accepting connections on port {}",
-                        new_listener.local_addr().expect(
+                    info!(
+                        target: &log_target,
+                        "Now accepting connections on port {}",
+                        listener.local_addr().expect(
                             "we should have been able to figure out our own address"
                         ).port()
                     );
-                    listener.replace(Some(new_listener));
-                    connection_wrapper.replace(Some(new_connection_wrapper));
+                    state.replace(Some(State {
+                        connection_wrapper,
+                        listener,
+                        log_target,
+                    }));
                 },
                 None => futures::future::pending().await,
             }
@@ -236,6 +239,7 @@ async fn accept_connections(
 struct ConnectionInfo {
     address: SocketAddr,
     connection: Box<dyn Connection>,
+    log_target: String,
     server_info: String,
 }
 
@@ -284,6 +288,7 @@ async fn handle_connection(
     let ConnectionInfo {
         address,
         connection,
+        log_target,
         server_info,
     } = connection_info;
     let mut connection_origin = Some(connection);
@@ -330,7 +335,8 @@ async fn handle_connection(
                 response.reason_phrase = "Not Found".into();
                 (response, connection, None)
             };
-        println!(
+        info!(
+            target: &log_target,
             "{}: {} - {} {} ({} bytes)",
             address,
             request_id,
@@ -486,24 +492,20 @@ async fn handle_connections(
                         // responses, until either the connection is closed or
                         // the connection is upgraded to another protocol.
                         let address = connection_info.address;
+                        let log_target = connection_info.log_target.clone();
                         if let Err(error) =
                             handle_connection(connection_info, handlers_ref)
                                 .await
                         {
-                            // TODO: We probably want better error reporting up
-                            // to the owner of this server, rather than
-                            // printing to standard error stream like a pleb.
-                            match error.source() {
-                                Some(source) => eprintln!(
-                                    "{}: error: {} ({})",
-                                    address, error, source
-                                ),
-                                None => {
-                                    eprintln!("{}: error: {}", address, error)
-                                },
-                            };
+                            error!(
+                                target: &log_target,
+                                "{}: {:?}", address, error
+                            );
                         };
-                        println!("{}: connection dropped", address);
+                        info!(
+                            target: &log_target,
+                            "{}: connection dropped", address
+                        );
 
                         // The output indicates that this is a future used to
                         // receive requests from a client and send back
@@ -540,9 +542,10 @@ async fn handle_messages(
                 WorkerMessage::Exit => unreachable!(),
 
                 WorkerMessage::StartListening {
-                    listener,
-                    result_sender,
                     connection_wrapper,
+                    listener,
+                    log_target,
+                    result_sender,
                 } => {
                     // It's possible for the `send` here to fail, if the user
                     // of the library gave up waiting for the result of
@@ -555,7 +558,8 @@ async fn handle_messages(
                             listener_sender
                                 .unbounded_send(ListenerMessage::Start{
                                     listener,
-                                    connection_wrapper
+                                    log_target,
+                                    connection_wrapper,
                                 })
                                 .expect("listener dropped before it reached the connection accepter");
                             Ok(())
@@ -606,6 +610,8 @@ async fn worker(
 }
 
 pub struct HttpServer {
+    log_target: String,
+
     // This sender is used to deliver messages to the worker thread.
     work_in: mpsc::UnboundedSender<WorkerMessage>,
 
@@ -625,7 +631,9 @@ impl HttpServer {
         // Store the sender end of the channel and spawn the worker thread,
         // giving it the receiver end as well as the TCP listener.
         let server_info = server_info.into();
+        let log_target = format!("HTTP server {:?}", server_info);
         Self {
+            log_target,
             work_in: sender,
             worker: Some(thread::spawn(|| {
                 executor::block_on(worker(receiver, server_info))
@@ -646,6 +654,15 @@ impl HttpServer {
                 handler,
             })
             .expect("worker message dropped before it could reach the worker");
+    }
+
+    pub fn set_log_target<T>(
+        &mut self,
+        log_target: T,
+    ) where
+        T: Into<String>,
+    {
+        self.log_target = log_target.into();
     }
 
     pub async fn start_with_connection_wrapper<W>(
@@ -670,9 +687,10 @@ impl HttpServer {
         // since it would mean we have a bug.
         self.work_in
             .unbounded_send(WorkerMessage::StartListening {
-                listener,
-                result_sender,
                 connection_wrapper: Box::new(connection_wrapper),
+                listener,
+                log_target: self.log_target.clone(),
+                result_sender,
             })
             .expect("worker message dropped before it could reach the worker");
         // It shouldn't be possible for this to fail, since the worker will
