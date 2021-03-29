@@ -411,10 +411,9 @@ async fn handle_connection(
                 on_upgraded(connection);
             }
             return Ok(());
-        } else {
-            connection_origin.replace(connection);
-            left_overs.replace(trailer);
         }
+        connection_origin.replace(connection);
+        left_overs.replace(trailer);
     }
 }
 
