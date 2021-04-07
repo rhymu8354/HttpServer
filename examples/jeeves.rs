@@ -35,6 +35,7 @@ use simple_logger::SimpleLogger;
 use std::{
     fs::File,
     io::BufReader,
+    net::SocketAddr,
     path::PathBuf,
     sync::Arc,
 };
@@ -42,6 +43,7 @@ use structopt::StructOpt;
 
 fn handle_request_factory(
     _request: Request,
+    _address: SocketAddr,
     connection: Box<dyn Connection>,
 ) -> ResourceFuture {
     async {

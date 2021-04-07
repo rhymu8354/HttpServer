@@ -73,8 +73,9 @@ pub struct FetchResults {
 
 pub type ResourceFuture = BoxFuture<'static, FetchResults>;
 
-type ResourceHandler =
-    dyn Fn(Request, Box<dyn Connection>) -> ResourceFuture + Send + Sync;
+type ResourceHandler = dyn Fn(Request, SocketAddr, Box<dyn Connection>) -> ResourceFuture
+    + Send
+    + Sync;
 
 type ResourceHandlerCollection = HashMap<Vec<Vec<u8>>, Arc<ResourceHandler>>;
 
@@ -322,7 +323,7 @@ async fn handle_connection(
             .map(Clone::clone);
         let (mut response, mut connection, on_upgraded) =
             if let Some(handler_factory) = handler_factory_reference {
-                let handler = handler_factory(request, connection);
+                let handler = handler_factory(request, address, connection);
                 let fetch_results = handler.await;
                 (
                     fetch_results.response,
